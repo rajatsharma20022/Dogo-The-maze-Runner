@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>This Is Fine — Code Clutch 2025</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a0a00;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:'Courier New',monospace;overflow:hidden}
+canvas{display:block;border:3px solid #ff6600;image-rendering:pixelated}
+#ui{color:#ffcc00;font-size:13px;margin-top:8px;opacity:0.7;letter-spacing:1px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">WASD / ARROW KEYS to move &nbsp;|&nbsp; SPACE to sip coffee (slow time)</div>
+<script>
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+const W=600,H=600;
+canvas.width=W;canvas.height=H;
+
+// Load doge image
+const dogeImg=new Image();
+dogeImg.src='image(43).png';
+
+// ===================== AUDIO SYSTEM =====================
+
+// Title screen music (looping)
+const titleAudio = new Audio('start.mpeg');
+titleAudio.volume = 0.7;
+titleAudio.loop = true;
+
+// Background gameplay music — two tracks, play one after other, loop forever
+const bgTracks = [
+  new Audio('backgroundsong1.mpeg'),
+  new Audio('backgroundsong2.mpeg')
+];
+bgTracks.forEach(t => t.volume = 0.6);
+let bgTrackIndex = 0;
+let bgMusicActive = false;
+
+bgTracks[0].addEventListener('ended', () => {
+  if (!bgMusicActive) return;
+  bgTrackIndex = 1;
+  bgTracks[1].currentTime = 0;
+  bgTracks[1].play().catch(()=>{});
+});
+bgTracks[1].addEventListener('ended', () => {
+  if (!bgMusicActive) return;
+  bgTrackIndex = 0;
+  bgTracks[0].currentTime = 0;
+  bgTracks[0].play().catch(()=>{});
+});
+
+// Coffee pickup sound
+const coffeeAudio = new Audio('a gaya swadh.mpeg');
+coffeeAudio.volume = 0.85;
+
+// Game over sound
+const gameOverAudio = new Audio('ma ka ladlai.mpeg');
+gameOverAudio.volume = 0.85;
+
+// Bark sound — plays when doge activates slow time (SPACE pressed)
+const barkAudio = new Audio('bark.mpeg');
+barkAudio.volume = 1.0;
+
+let gameOverPlayed = false;
+let titleMusicStarted = false;
+
+function stopAll() {
+  [titleAudio, ...bgTracks, coffeeAudio, gameOverAudio, barkAudio].forEach(a => {
+    a.pause(); a.currentTime = 0;
+  });
+  bgMusicActive = false;
+  bgTrackIndex = 0;
+}
+
+function playTitleMusic() {
+  stopAll();
+  titleAudio.play().catch(()=>{});
+}
+
+function startBgMusic() {
+  stopAll();
+  bgMusicActive = true;
+  bgTrackIndex = 0;
+  bgTracks[0].play().catch(()=>{});
+}
+
+function stopBgMusic() {
+  bgTracks.forEach(t => { t.pause(); t.currentTime = 0; });
+  bgMusicActive = false;
+}
+
+function playCoffeeSound() {
+  coffeeAudio.currentTime = 0;
+  coffeeAudio.play().catch(()=>{});
+}
+
+function playGameOverSound() {
+  if (gameOverPlayed) return;
+  gameOverPlayed = true;
+  stopBgMusic();
+  coffeeAudio.pause();
+  gameOverAudio.currentTime = 0;
+  gameOverAudio.play().catch(()=>{});
+}
+
+// Browsers block autoplay until user interacts — unlock on first key/click
+let audioUnlocked = false;
+function unlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  // Play & immediately pause a silent buffer to unlock the audio context
+  [titleAudio, ...bgTracks, coffeeAudio, gameOverAudio, barkAudio].forEach(a => {
+    a.play().catch(()=>{});
+    a.pause();
+    a.currentTime = 0;
+  });
+  // Now actually start title music
+  if (state === 'title') {
+    titleMusicStarted = true;
+    playTitleMusic();
+  }
+}
+
+// ========================================================
+
+// State
+let state='title';
+let score=0,hiScore=0,timer=0,frame=0;
+let slowTime=false,slowCooldown=0,slowFuel=100;
+let shakeX=0,shakeY=0;
+
+const player={x:W/2,y:H/2,r:22,speed:3.2,vx:0,vy:0};
+let hazards=[],particles=[],coffeePickups=[];
+
+// ===================== MID-BOSS SYSTEM =====================
+// Boss triggers around 60s (3600 frames). It's a giant flaming office chair.
+// Phase: 'warning' → 'charging' → 'done'
+let boss=null;
+let bossWarningTimer=0;
+const BOSS_TRIGGER_TIME=3540; // ~59s, gives 1s warning before 60s
+const BOSS_WARNING_DURATION=180; // 3 sec warning
+const BOSS_SPEED=9.5;           // very fast charge speed
+const BOSS_R=36;                // big radius
+let bossSpawned=false;          // only once per run
+
+function spawnBoss(){
+  // Pick a random side to enter from, aim straight at player
+  const side=rndInt(0,3);
+  let x,y;
+  if(side===0){x=rnd(80,W-80);y=-BOSS_R-10;}
+  else if(side===1){x=W+BOSS_R+10;y=rnd(80,H-80);}
+  else if(side===2){x=rnd(80,W-80);y=H+BOSS_R+10;}
+  else{x=-BOSS_R-10;y=rnd(80,H-80);}
+  const angle=Math.atan2(player.y-y,player.x-x);
+  boss={
+    x,y,
+    vx:Math.cos(angle)*BOSS_SPEED,
+    vy:Math.sin(angle)*BOSS_SPEED,
+    r:BOSS_R,
+    rot:0,
+    rotSpeed:0.06,
+    phase:'charging', // skip straight to charging after warning
+    alpha:1,
+    alive:true,
+    trail:[] // fire trail
+  };
+}
+
+function drawBossWarning(){
+  // Flashing red vignette + text countdown
+  const pulse=0.5+0.5*Math.sin(Date.now()/80);
+  ctx.fillStyle=`rgba(180,0,0,${0.18*pulse})`;
+  ctx.fillRect(0,0,W,H);
+
+  // Warning border flicker
+  ctx.strokeStyle=`rgba(255,50,0,${0.7*pulse})`;
+  ctx.lineWidth=12;
+  ctx.strokeRect(6,6,W-12,H-12);
+
+  // Big warning text
+  ctx.save();
+  ctx.textAlign='center';
+  ctx.shadowColor='#FF0000';ctx.shadowBlur=30*pulse;
+  ctx.fillStyle=`rgba(255,${Math.floor(50+50*pulse)},0,${0.85+0.15*pulse})`;
+  ctx.font=`bold 48px Courier New`;
+  ctx.fillText('⚠ BOSS INCOMING ⚠',W/2,H/2-30);
+  ctx.shadowBlur=0;
+  ctx.fillStyle=YELLOW;
+  ctx.font='bold 22px Courier New';
+  ctx.fillText('THE OFFICE CHAIR OF DOOM',W/2,H/2+16);
+  ctx.fillStyle='rgba(255,200,100,0.8)';
+  ctx.font='14px Courier New';
+  ctx.fillText('brace yourself...',W/2,H/2+46);
+  ctx.restore();
+}
+
+function drawBossChair(x,y,r,rot,alpha){
+  ctx.save();
+  ctx.globalAlpha=alpha;
+  ctx.translate(x,y);
+  ctx.rotate(rot);
+
+  // Outer glow / aura
+  const glowPulse=0.6+0.4*Math.sin(Date.now()/100);
+  const grd=ctx.createRadialGradient(0,0,r*0.3,0,0,r*2.2);
+  grd.addColorStop(0,`rgba(255,80,0,${0.35*glowPulse})`);
+  grd.addColorStop(0.5,`rgba(200,0,0,${0.2*glowPulse})`);
+  grd.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=grd;
+  ctx.beginPath();ctx.arc(0,0,r*2.2,0,Math.PI*2);ctx.fill();
+
+  // Chair base / wheels (5 spokes)
+  ctx.strokeStyle='#333';ctx.lineWidth=r*0.12;
+  for(let i=0;i<5;i++){
+    const a=(i/5)*Math.PI*2;
+    ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(Math.cos(a)*r*0.85,Math.sin(a)*r*0.85);ctx.stroke();
+    // wheel
+    ctx.fillStyle='#222';
+    ctx.beginPath();ctx.arc(Math.cos(a)*r*0.85,Math.sin(a)*r*0.85,r*0.13,0,Math.PI*2);ctx.fill();
+  }
+
+  // Gas cylinder (center pole)
+  ctx.fillStyle='#555';
+  ctx.beginPath();ctx.roundRect(-r*0.1,-r*0.6,r*0.2,r*0.75,4);ctx.fill();
+  ctx.fillStyle='#888';
+  ctx.beginPath();ctx.roundRect(-r*0.08,-r*0.55,r*0.08,r*0.55,3);ctx.fill();
+
+  // Seat cushion
+  const seatGrad=ctx.createLinearGradient(-r*0.6,-r*0.65,r*0.6,-r*0.2);
+  seatGrad.addColorStop(0,'#8B0000');
+  seatGrad.addColorStop(0.4,'#CC1100');
+  seatGrad.addColorStop(1,'#660000');
+  ctx.fillStyle=seatGrad;
+  ctx.beginPath();ctx.ellipse(0,-r*0.42,r*0.62,r*0.28,0,0,Math.PI*2);ctx.fill();
+  // seat shine
+  ctx.fillStyle='rgba(255,100,100,0.25)';
+  ctx.beginPath();ctx.ellipse(-r*0.12,-r*0.5,r*0.28,r*0.1,0,0,Math.PI*2);ctx.fill();
+
+  // Backrest
+  const backGrad=ctx.createLinearGradient(-r*0.5,-r*1.35,r*0.5,-r*0.65);
+  backGrad.addColorStop(0,'#7A0000');
+  backGrad.addColorStop(1,'#BB1100');
+  ctx.fillStyle=backGrad;
+  ctx.beginPath();ctx.roundRect(-r*0.5,-r*1.35,r*1.0,r*0.72,r*0.12);ctx.fill();
+  // backrest rivets
+  ctx.fillStyle='rgba(255,180,100,0.5)';
+  [[-0.28,-1.1],[0.28,-1.1],[-0.28,-0.82],[0.28,-0.82]].forEach(([bx,by])=>{
+    ctx.beginPath();ctx.arc(bx*r,by*r,r*0.055,0,Math.PI*2);ctx.fill();
+  });
+
+  // Armrests
+  ctx.fillStyle='#8B0000';
+  ctx.beginPath();ctx.roundRect(-r*0.72,-r*0.72,r*0.16,r*0.42,4);ctx.fill();
+  ctx.beginPath();ctx.roundRect(r*0.56,-r*0.72,r*0.16,r*0.42,4);ctx.fill();
+  ctx.fillStyle='#333';
+  ctx.beginPath();ctx.roundRect(-r*0.76,-r*0.72,r*0.22,r*0.1,3);ctx.fill();
+  ctx.beginPath();ctx.roundRect(r*0.54,-r*0.72,r*0.22,r*0.1,3);ctx.fill();
+
+  // BOSS label on backrest
+  ctx.fillStyle=YELLOW;
+  ctx.font=`bold ${Math.floor(r*0.28)}px Courier New`;
+  ctx.textAlign='center';
+  ctx.fillText('BOSS',0,-r*1.0);
+
+  // Flames shooting out bottom/back
+  for(let f=0;f<6;f++){
+    const fa=Math.PI*0.4+f*0.28+Math.sin(Date.now()/80+f)*0.3;
+    const flen=r*(0.6+0.5*Math.random());
+    const fx=Math.cos(fa)*flen, fy=Math.sin(fa)*flen+r*0.3;
+    const fg=ctx.createRadialGradient(fx*0.3,fy*0.3,1,fx,fy,r*0.4);
+    fg.addColorStop(0,'rgba(255,220,50,0.9)');
+    fg.addColorStop(0.4,'rgba(255,80,0,0.7)');
+    fg.addColorStop(1,'rgba(150,0,0,0)');
+    ctx.fillStyle=fg;
+    ctx.beginPath();ctx.arc(fx,fy,r*0.38,0,Math.PI*2);ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+function updateBoss(dt){
+  if(!boss||!boss.alive)return;
+
+  // Leave trail particles
+  if(frame%3===0){
+    spawnParticle(boss.x,boss.y,'#FF4400',2);
+    spawnParticle(boss.x,boss.y,YELLOW,1);
+  }
+
+  boss.x+=boss.vx*dt;
+  boss.y+=boss.vy*dt;
+  boss.rot+=boss.rotSpeed*dt;
+
+  // Kill boss when it exits the arena (it charges straight through)
+  if(boss.x<-BOSS_R*3||boss.x>W+BOSS_R*3||boss.y<-BOSS_R*3||boss.y>H+BOSS_R*3){
+    boss.alive=false;
+    boss=null;
+    return;
+  }
+
+  // Check collision with player (bigger hit radius — it's a boss!)
+  if(dist(boss,player)<boss.r+player.r-8){
+    spawnParticle(player.x,player.y,RED,16);
+    spawnParticle(player.x,player.y,ORANGE,12);
+    spawnParticle(player.x,player.y,YELLOW,8);
+    shakeX=20;shakeY=20;
+    hiScore=Math.max(hiScore,score);
+    state='dead';
+    boss=null;
+    playGameOverSound();
+  }
+}
+// ============================================================
+
+const keys={};
+document.addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(e.code==='Space') e.preventDefault();
+  unlockAudio();
+});
+document.addEventListener('keyup',e=>keys[e.code]=false);
+document.addEventListener('click', unlockAudio, {once:true});
+document.addEventListener('touchstart', unlockAudio, {once:true});
+
+const ORANGE='#FF6600',YELLOW='#FFCC00',RED='#CC2200',CREAM='#F5E6C8',BROWN='#7B3F00',SMOKE='#888877',WHITE='#FFFFFF',BLACK='#111111',GREEN='#44BB44';
+
+function rnd(a,b){return a+Math.random()*(b-a);}
+function rndInt(a,b){return Math.floor(rnd(a,b+1));}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+function clamp(v,lo,hi){return Math.max(lo,Math.min(hi,v));}
+
+function getDiff(){return Math.min(1, timer / 10800);}
+function getBaseSpeed(){const d=getDiff();return 0.5 + d * 2.0;}
+function getSpawnRate(){const d=getDiff();return Math.max(14, 80 - d*66);}
+function getMaxHazards(){const d=getDiff();return Math.floor(3 + d * 12);}
+
+function spawnHazard(){
+  if(hazards.length>=getMaxHazards())return;
+  const side=rndInt(0,3);
+  let x,y;
+  if(side===0){x=rnd(0,W);y=-24;}
+  else if(side===1){x=W+24;y=rnd(0,H);}
+  else if(side===2){x=rnd(0,W);y=H+24;}
+  else{x=-24;y=rnd(0,H);}
+  const toPlayer=Math.atan2(player.y-y,player.x-x);
+  const angle=toPlayer+rnd(-0.45,0.45);
+  const spd=getBaseSpeed()*rnd(0.85,1.2);
+  const types=['flame','flame','flame','mug','report','flame'];
+  const d=getDiff();
+  const typePool=d>0.5?['flame','flame','mug','mug','report','report']:types;
+  const type=typePool[rndInt(0,typePool.length-1)];
+  hazards.push({x,y,type,speed:spd,vx:Math.cos(angle)*spd,vy:Math.sin(angle)*spd,
+    r:type==='report'?15:type==='mug'?13:16,
+    rot:rnd(0,Math.PI*2),rotSpeed:rnd(-0.06,0.06)*(1+d),alpha:1});
+}
+
+function spawnCoffee(){
+  coffeePickups.push({x:rnd(50,W-50),y:rnd(50,H-50),r:14,life:320});
+}
+
+function spawnParticle(x,y,color,count=8){
+  for(let i=0;i<count;i++){
+    const a=rnd(0,Math.PI*2);
+    particles.push({x,y,color,vx:Math.cos(a)*rnd(1,5),vy:Math.sin(a)*rnd(1,5),life:rndInt(20,45),maxLife:45,r:rnd(2,5.5)});
+  }
+}
+
+function drawFlame(x,y,r,rot,alpha){
+  ctx.save();ctx.globalAlpha=alpha*0.9;ctx.translate(x,y);ctx.rotate(rot);
+  ctx.fillStyle='#AA1100';ctx.beginPath();ctx.ellipse(0,0,r,r*1.5,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle=ORANGE;ctx.beginPath();ctx.ellipse(0,r*0.1,r*0.65,r,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle=YELLOW;ctx.beginPath();ctx.ellipse(0,r*0.2,r*0.35,r*0.6,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='rgba(255,255,200,0.7)';ctx.beginPath();ctx.ellipse(0,r*0.25,r*0.15,r*0.3,0,0,Math.PI*2);ctx.fill();
+  ctx.restore();
+}
+
+function drawMug(x,y,r,rot,alpha){
+  ctx.save();ctx.globalAlpha=alpha;ctx.translate(x,y);ctx.rotate(rot);
+  ctx.fillStyle='#EEEEEE';ctx.fillRect(-r*0.75,-r*0.75,r*1.5,r*1.5);
+  ctx.strokeStyle='#EEEEEE';ctx.lineWidth=3.5;
+  ctx.beginPath();ctx.arc(r*0.75,0,r*0.42,-Math.PI/2,Math.PI/2);ctx.stroke();
+  ctx.fillStyle='#5C2D00';ctx.fillRect(-r*0.6,-r*0.45,r*1.2,r*0.75);
+  ctx.strokeStyle=SMOKE;ctx.lineWidth=1.8;
+  for(let i=-1;i<=1;i++){
+    ctx.beginPath();ctx.moveTo(i*r*0.3,-r*0.8);
+    ctx.quadraticCurveTo(i*r*0.3+5,-r*1.1,i*r*0.3,-r*1.3);
+    ctx.stroke();
+  }
+  ctx.fillStyle='rgba(200,0,0,0.5)';ctx.font=`bold ${Math.floor(r*0.55)}px Courier New`;
+  ctx.textAlign='center';ctx.fillText('HOT',0,r*0.2);
+  ctx.restore();
+}
+
+function drawReport(x,y,r,rot,alpha){
+  ctx.save();ctx.globalAlpha=alpha;ctx.translate(x,y);ctx.rotate(rot);
+  ctx.fillStyle=CREAM;ctx.fillRect(-r,-r*1.35,r*2,r*2.7);
+  ctx.fillStyle='rgba(100,100,100,0.5)';
+  for(let row=-r+5;row<r*1.3;row+=6){
+    ctx.fillRect(-r*0.72,row,r*1.44*rnd(0.4,1),2);
+  }
+  ctx.save();ctx.rotate(-0.2);
+  ctx.fillStyle='rgba(180,0,0,0.75)';ctx.font=`bold ${Math.floor(r*0.72)}px Courier New`;
+  ctx.textAlign='center';ctx.strokeStyle='rgba(180,0,0,0.75)';ctx.lineWidth=1;
+  ctx.fillText('FINE',0,r*0.35);ctx.strokeText('FINE',0,r*0.35);
+  ctx.restore();ctx.restore();
+}
+
+function drawDoge(x,y,r){
+  ctx.save();
+  if(slowTime){
+    ctx.shadowColor='#88AAFF';ctx.shadowBlur=18;
+    ctx.fillStyle='rgba(100,150,255,0.18)';
+    ctx.beginPath();ctx.arc(x,y,r+10,0,Math.PI*2);ctx.fill();
+    ctx.shadowBlur=0;
+  }
+  ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.clip();
+  ctx.fillStyle='#F5E6C8';ctx.fillRect(x-r,y-r,r*2,r*2);
+  if(dogeImg.complete&&dogeImg.naturalWidth>0){
+    const sz=r*2.1;ctx.drawImage(dogeImg,x-sz*0.5,y-sz*0.55,sz,sz);
+  } else {
+    ctx.fillStyle='#E8A840';ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle=BLACK;ctx.beginPath();ctx.arc(x-r*0.25,y-r*0.15,r*0.12,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(x+r*0.25,y-r*0.15,r*0.12,0,Math.PI*2);ctx.fill();
+  }
+  ctx.restore();
+  ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.strokeStyle=slowTime?'#88AAFF':'rgba(255,255,255,0.4)';
+  ctx.lineWidth=slowTime?3:2;ctx.stroke();
+}
+
+function drawBackground(){
+  const d=getDiff();
+  ctx.fillStyle=`rgb(${Math.floor(18+d*12)},${Math.floor(32+d*18)},${Math.floor(48+d*18)})`;
+  ctx.fillRect(0,0,W,H);
+  const ts=52;
+  for(let x=0;x<W;x+=ts)
+    for(let y=0;y<H;y+=ts)
+      if((Math.floor(x/ts)+Math.floor(y/ts))%2===0){
+        ctx.fillStyle=`rgba(28,60,90,${0.45+d*0.2})`;
+        ctx.fillRect(x,y,ts,ts);
+      }
+  if(d>0.2){
+    const fireH=Math.floor(d*80);
+    for(let fx=0;fx<W;fx+=18){
+      const flicker=rnd(0.6,1);
+      ctx.fillStyle=`rgba(200,50,0,${d*0.35*flicker})`;ctx.fillRect(fx,H-fireH*flicker,14,fireH*flicker);
+      ctx.fillStyle=`rgba(255,150,0,${d*0.25*flicker})`;ctx.fillRect(fx+3,H-fireH*flicker*0.7,8,fireH*flicker*0.7);
+    }
+    for(let fx=0;fx<W;fx+=18){
+      const flicker=rnd(0.6,1);
+      ctx.fillStyle=`rgba(200,50,0,${d*0.3*flicker})`;ctx.fillRect(fx,0,14,fireH*flicker*0.8);
+    }
+  }
+  const intensity=Math.min(1,d);
+  const grd=ctx.createRadialGradient(W/2,H/2,10,W/2,H/2,W*0.78);
+  grd.addColorStop(0,'rgba(0,0,0,0)');
+  grd.addColorStop(1,`rgba(200,50,0,${0.1+intensity*0.3})`);
+  ctx.fillStyle=grd;ctx.fillRect(0,0,W,H);
+  if(d>0.7){
+    ctx.strokeStyle=`rgba(255,80,0,${(d-0.7)*0.5})`;ctx.lineWidth=1.5;
+    [[W*0.1,0,W*0.15,H*0.3],[W*0.9,0,W*0.85,H*0.25],[0,H*0.5,W*0.2,H*0.55],[W,H*0.4,W*0.82,H*0.6]].forEach(([x1,y1,x2,y2])=>{
+      ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+    });
+  }
+}
+
+function drawHUD(){
+  const d=getDiff();
+  ctx.fillStyle=YELLOW;ctx.font='bold 22px Courier New';ctx.textAlign='left';
+  ctx.fillText('SCORE: '+Math.floor(score),14,30);
+  ctx.fillStyle=ORANGE;ctx.font='14px Courier New';ctx.fillText('BEST: '+Math.floor(hiScore),14,50);
+  const secs=Math.floor(timer/60);
+  ctx.fillStyle=WHITE;ctx.textAlign='right';ctx.font='14px Courier New';
+  ctx.fillText('TIME: '+secs+'s',W-14,30);
+  ctx.fillStyle='rgba(0,0,0,0.4)';ctx.fillRect(W-154,36,144,10);
+  const dCol=d<0.4?'#44FF44':d<0.7?'#FFAA00':'#FF2200';
+  ctx.fillStyle=dCol;ctx.fillRect(W-154,36,144*d,10);
+  ctx.strokeStyle='rgba(255,255,255,0.3)';ctx.lineWidth=1;ctx.strokeRect(W-154,36,144,10);
+  ctx.fillStyle=dCol;ctx.font='10px Courier New';ctx.textAlign='right';
+  ctx.fillText(d<0.33?'FINE...':d<0.66?'HOT IN HERE...':'EVERYTHING IS FINE!',W-14,33);
+  const barW=140,barH=14,bx=W-barW-14,by=H-32;
+  ctx.fillStyle='#222';ctx.fillRect(bx,by,barW,barH);
+  const fuelCol=slowTime?'#88AAFF':slowFuel>30?BROWN:RED;
+  ctx.fillStyle=fuelCol;ctx.fillRect(bx,by,barW*(slowFuel/100),barH);
+  ctx.strokeStyle=WHITE;ctx.lineWidth=1;ctx.strokeRect(bx,by,barW,barH);
+  ctx.fillStyle=WHITE;ctx.font='11px Courier New';ctx.textAlign='right';
+  ctx.fillText('COFFEE [SPACE]',W-14,by-4);
+  if(slowCooldown>0){
+    ctx.fillStyle=`rgba(255,80,0,${slowCooldown/120*0.7})`;
+    ctx.font='bold 13px Courier New';ctx.textAlign='center';
+    ctx.fillText('COOLING DOWN...',W/2,H-14);
+  }
+  ctx.fillStyle='rgba(255,200,100,0.4)';ctx.font='10px Courier New';ctx.textAlign='left';
+  ctx.fillText('CHAOS: '+hazards.length,14,H-14);
+  // Boss active indicator
+  if(boss&&boss.alive){
+    ctx.save();
+    const bp=0.6+0.4*Math.sin(Date.now()/120);
+    ctx.fillStyle=`rgba(255,${Math.floor(40+40*bp)},0,${0.85+0.15*bp})`;
+    ctx.font='bold 13px Courier New';ctx.textAlign='center';
+    ctx.shadowColor='#FF0000';ctx.shadowBlur=10;
+    ctx.fillText('☠ BOSS ACTIVE — DODGE THE CHAIR! ☠',W/2,H-14);
+    ctx.restore();
+  }
+}
+
+function drawTitle(){
+  ctx.fillStyle='rgba(10,4,0,0.9)';ctx.fillRect(0,0,W,H);
+  const t=Date.now()/400;
+  ctx.strokeStyle=ORANGE;ctx.lineWidth=4;
+  for(let pass=0;pass<2;pass++){
+    ctx.beginPath();
+    for(let i=0;i<=40;i++){
+      const px=(i/40)*W;
+      const py=pass===0?4+Math.sin(i*0.7+t)*6:H-4+Math.sin(i*0.7+t+1)*6;
+      i===0?ctx.moveTo(px,py):ctx.lineTo(px,py);
+    }
+    ctx.stroke();
+  }
+  ctx.textAlign='center';
+  ctx.shadowColor=RED;ctx.shadowBlur=20;
+  ctx.fillStyle=RED;ctx.font='bold 66px Courier New';ctx.fillText('THIS IS',W/2,H/2-90);
+  ctx.fillStyle=ORANGE;ctx.font='bold 76px Courier New';ctx.fillText('FINE',W/2,H/2-12);
+  ctx.shadowBlur=0;
+  drawDoge(W/2,H/2+78,32);
+  ctx.fillStyle=YELLOW;ctx.font='17px Courier New';ctx.fillText('dodge flames, mugs & reports',W/2,H/2+146);
+  ctx.fillStyle='rgba(255,200,150,0.7)';ctx.font='13px Courier New';ctx.fillText('👑 a boss chair appears at 60s — brace yourself',W/2,H/2+168);
+  const blink=Math.floor(Date.now()/600)%2;
+  if(blink){ctx.fillStyle=WHITE;ctx.font='bold 15px Courier New';ctx.fillText('[ PRESS ENTER TO BEGIN ]',W/2,H/2+196);}
+  if(hiScore>0){ctx.fillStyle=ORANGE;ctx.font='13px Courier New';ctx.fillText('BEST: '+Math.floor(hiScore),W/2,H-20);}
+}
+
+function drawDead(){
+  ctx.fillStyle='rgba(10,0,0,0.85)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.shadowColor=RED;ctx.shadowBlur=18;
+  ctx.fillStyle=RED;ctx.font='bold 50px Courier New';ctx.fillText('GAME OVER',W/2,H/2-100);
+  ctx.shadowBlur=0;
+  ctx.fillStyle=ORANGE;ctx.font='22px Courier New';ctx.fillText('(This is fine.)',W/2,H/2-60);
+  drawDoge(W/2,H/2+8,32);
+  ctx.fillStyle=YELLOW;ctx.font='20px Courier New';ctx.fillText('SCORE: '+Math.floor(score),W/2,H/2+88);
+  ctx.fillStyle='rgba(255,200,100,0.7)';ctx.font='14px Courier New';
+  ctx.fillText('Survived: '+Math.floor(timer/60)+'s  |  Peak chaos: '+Math.floor(getDiff()*100)+'%',W/2,H/2+112);
+  if(score>=hiScore&&score>0){ctx.fillStyle=GREEN;ctx.font='bold 16px Courier New';ctx.fillText('NEW BEST!',W/2,H/2+136);}
+  const blink=Math.floor(Date.now()/600)%2;
+  if(blink){ctx.fillStyle=WHITE;ctx.font='15px Courier New';ctx.fillText('[ ENTER to play again ]',W/2,H/2+162);}
+}
+
+function resetGame(){
+  player.x=W/2;player.y=H/2;player.vx=0;player.vy=0;
+  hazards=[];particles=[];coffeePickups=[];
+  score=0;timer=0;frame=0;
+  slowTime=false;slowCooldown=0;slowFuel=100;
+  shakeX=0;shakeY=0;
+  gameOverPlayed=false;
+  boss=null;bossSpawned=false;bossWarningTimer=0;
+  gameOverAudio.pause();gameOverAudio.currentTime=0;
+}
+
+function update(){
+  if(state!=='playing')return;
+  frame++;
+  const dt=slowTime?0.38:1;
+  timer++;
+  score+=dt*0.8*(1+getDiff()*0.5);
+
+  let dx=0,dy=0;
+  if(keys['ArrowLeft']||keys['KeyA'])dx-=1;
+  if(keys['ArrowRight']||keys['KeyD'])dx+=1;
+  if(keys['ArrowUp']||keys['KeyW'])dy-=1;
+  if(keys['ArrowDown']||keys['KeyS'])dy+=1;
+  if(dx&&dy){dx*=0.707;dy*=0.707;}
+  const spd=player.speed*(slowTime?0.7:1);
+  player.x=clamp(player.x+dx*spd,player.r,W-player.r);
+  player.y=clamp(player.y+dy*spd,player.r,H-player.r);
+
+  const wasSlowTime = slowTime;
+  if(keys['Space']&&slowFuel>0&&slowCooldown<=0){
+    slowTime=true;slowFuel=Math.max(0,slowFuel-1.6);
+    if(!wasSlowTime){ // just activated — bark once!
+      barkAudio.currentTime=0;
+      barkAudio.play().catch(()=>{});
+    }
+    if(slowFuel<=0){slowTime=false;slowCooldown=130;}
+  } else {
+    if(!keys['Space'])slowTime=false;
+    if(slowFuel<100&&!slowTime)slowFuel=Math.min(100,slowFuel+0.22);
+    if(slowCooldown>0)slowCooldown--;
+  }
+
+  const sr=getSpawnRate();
+  if(frame%Math.max(1,Math.floor(sr*dt))===0)spawnHazard();
+  if(frame%420===0&&coffeePickups.length<2)spawnCoffee();
+
+  // ---- BOSS TRIGGER at ~60s ----
+  if(!bossSpawned){
+    if(timer>=BOSS_TRIGGER_TIME && bossWarningTimer===0){
+      bossWarningTimer=1; // start warning countdown
+    }
+    if(bossWarningTimer>0){
+      bossWarningTimer+=dt;
+      if(bossWarningTimer>=BOSS_WARNING_DURATION){
+        bossSpawned=true;
+        bossWarningTimer=0;
+        spawnBoss();
+        // Big screen shake on boss spawn
+        shakeX=18;shakeY=18;
+      }
+    }
+  }
+  // Update boss movement & collision
+  if(boss&&boss.alive) updateBoss(dt);
+  // ---- END BOSS ----
+
+  for(let i=hazards.length-1;i>=0;i--){
+    const h=hazards[i];
+    h.x+=h.vx*dt;h.y+=h.vy*dt;h.rot+=h.rotSpeed*dt;
+    if(h.x<-90||h.x>W+90||h.y<-90||h.y>H+90){hazards.splice(i,1);continue;}
+    if(dist(h,player)<h.r+player.r-5){
+      spawnParticle(player.x,player.y,RED,10);
+      spawnParticle(player.x,player.y,ORANGE,8);
+      shakeX=10;shakeY=10;
+      hiScore=Math.max(hiScore,score);
+      state='dead';
+      playGameOverSound(); // 🎵 ma ka ladlai
+      return;
+    }
+  }
+
+  for(let i=coffeePickups.length-1;i>=0;i--){
+    const c=coffeePickups[i];
+    c.life-=dt;
+    if(c.life<=0){coffeePickups.splice(i,1);continue;}
+    if(dist(c,player)<c.r+player.r){
+      slowFuel=Math.min(100,slowFuel+45);slowCooldown=0;
+      playCoffeeSound(); // 🎵 a gaya swadh
+      spawnParticle(c.x,c.y,BROWN,6);score+=25;
+      coffeePickups.splice(i,1);
+    }
+  }
+
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.x+=p.vx;p.y+=p.vy;p.vx*=0.91;p.vy*=0.91;p.life--;
+    if(p.life<=0)particles.splice(i,1);
+  }
+  shakeX*=0.78;shakeY*=0.78;
+}
+
+function draw(){
+  ctx.save();
+  ctx.translate(shakeX*(Math.random()-0.5)*2,shakeY*(Math.random()-0.5)*2);
+  drawBackground();
+  if(state==='playing'){
+    coffeePickups.forEach(c=>{
+      const pulse=0.85+0.15*Math.sin(Date.now()/200);
+      ctx.save();ctx.globalAlpha=Math.min(1,c.life/60)*pulse;ctx.translate(c.x,c.y);
+      ctx.fillStyle=WHITE;ctx.fillRect(-c.r,-c.r*0.65,c.r*2,c.r*1.5);
+      ctx.fillStyle=BROWN;ctx.fillRect(-c.r*0.82,-c.r*0.42,c.r*1.64,c.r);
+      ctx.strokeStyle=WHITE;ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(c.r*0.82,0,c.r*0.42,-Math.PI/2,Math.PI/2);ctx.stroke();
+      ctx.fillStyle=YELLOW;ctx.font='bold 10px Courier New';ctx.textAlign='center';
+      ctx.fillText('+COFFEE',0,c.r*1.7);ctx.restore();
+    });
+    hazards.forEach(h=>{
+      if(h.type==='flame')drawFlame(h.x,h.y,h.r,h.rot,h.alpha);
+      else if(h.type==='mug')drawMug(h.x,h.y,h.r,h.rot,h.alpha);
+      else drawReport(h.x,h.y,h.r,h.rot,h.alpha);
+    });
+    particles.forEach(p=>{
+      ctx.globalAlpha=p.life/p.maxLife;ctx.fillStyle=p.color;
+      ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fill();
+    });
+    ctx.globalAlpha=1;
+    drawDoge(player.x,player.y,player.r);
+
+    // Draw boss if active
+    if(boss&&boss.alive) drawBossChair(boss.x,boss.y,boss.r,boss.rot,boss.alpha);
+
+    // Boss warning overlay (drawn on top, before HUD)
+    if(!bossSpawned&&bossWarningTimer>0) drawBossWarning();
+    if(slowTime){
+      const sv=ctx.createRadialGradient(W/2,H/2,W*0.18,W/2,H/2,W*0.72);
+      sv.addColorStop(0,'rgba(0,60,140,0)');sv.addColorStop(1,'rgba(0,20,100,0.4)');
+      ctx.fillStyle=sv;ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='rgba(80,140,255,0.04)';
+      for(let sy=0;sy<H;sy+=4)ctx.fillRect(0,sy,W,2);
+    }
+    drawHUD();
+  }
+  ctx.restore();
+  if(state==='title')drawTitle();
+  if(state==='dead')drawDead();
+}
+
+function loop(){update();draw();requestAnimationFrame(loop);}
+
+document.addEventListener('keydown',e=>{
+  if(e.code==='Enter'){
+    if(state==='title'||state==='dead'){
+      resetGame();
+      state='playing';
+      startBgMusic(); // 🎵 backgroundsong1 → backgroundsong2 → loop
+    }
+  }
+});
+
+loop();
+</script>
+</body>
+</html>
